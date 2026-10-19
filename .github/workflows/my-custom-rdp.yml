@@ -1,0 +1,133 @@
+name: Windows RDP New
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  windows-rdp:
+    # Runs on your own Windows 10 64-bit machine registered as a self-hosted runner.
+    # Windows 10 is supported for self-hosted runners only (no GitHub-hosted Windows 10 image exists).
+    # Add the label "windows-10" when registering the runner, or use [self-hosted, windows, X64] instead.
+    runs-on: [self-hosted, windows-10]
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure RDP Settings
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Rule" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Rule" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Admin Privileges
+        shell: powershell
+        run: |
+          $cfgPath = "$env:TEMP\secpol.cfg"
+          $dbPath  = "$env:TEMP\secedit.sdb"
+          secedit /export /cfg $cfgPath
+          $content = Get-Content $cfgPath -Encoding Unicode
+          $content = $content -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0'
+          $content = $content -replace 'MinimumPasswordLength = \d+', 'MinimumPasswordLength = 0'
+          $content | Set-Content $cfgPath -Encoding Unicode
+          secedit /configure /db $dbPath /cfg $cfgPath /areas SECURITYPOLICY /quiet
+          gpupdate /force | Out-Null
+          net user RDP 12345 /add
+          net localgroup Administrators RDP /add
+          net localgroup "Remote Desktop Users" RDP /add
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'ConsentPromptBehaviorAdmin' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'EnableLUA' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'PromptOnSecureDesktop' -Value 0 -Force
+          Write-Host "User: RDP | Password: 12345 | Admin: Full (UAC disabled)"
+
+      - name: Install OpenCode
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # OpenCode's official Windows installation path.
+          npm install --global opencode-ai
+          if ($LASTEXITCODE -ne 0) {
+            throw "OpenCode installation failed"
+          }
+          $opencode = (Get-Command opencode.cmd -ErrorAction SilentlyContinue).Source
+          if (-not $opencode) {
+            $opencode = (Get-Command opencode -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $opencode) {
+            throw "OpenCode was installed but its command was not found"
+          }
+
+          # Make lm work in both CMD and PowerShell terminals.
+          $binDir = Join-Path $env:USERPROFILE "bin"
+          New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+          $lmCmdPath = Join-Path $binDir "lm.cmd"
+          "@echo off`r`nopencode %*`r`n" | Set-Content -Path $lmCmdPath -Encoding ASCII
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $pathParts = @($userPath -split ";" | Where-Object { $_ })
+          if ($pathParts -notcontains $binDir) {
+            [Environment]::SetEnvironmentVariable("Path", (($pathParts + $binDir) -join ";"), "User")
+          }
+          $env:Path = "$binDir;$env:Path"
+
+          $profileBlock = "`n# OpenCode launcher`nfunction lm { opencode @args }`n"
+          $profileDirs = @(
+            (Join-Path $env:USERPROFILE "Documents\WindowsPowerShell"),
+            (Join-Path $env:USERPROFILE "Documents\PowerShell")
+          )
+          foreach ($profileDir in $profileDirs) {
+            New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+            $profilePath = Join-Path $profileDir "Microsoft.PowerShell_profile.ps1"
+            if (-not (Test-Path $profilePath) -or -not (Select-String -Path $profilePath -Pattern "function lm" -Quiet)) {
+              Add-Content -Path $profilePath -Value $profileBlock
+            }
+          }
+
+          Write-Host "OpenCode installed. Type lm in a new PowerShell/CMD terminal to launch OpenCode."
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $p = "$env:TEMP\ts.msi"
+          Invoke-WebRequest -Uri $url -OutFile $p -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i","`"$p`"","/quiet","/norestart" -Wait
+          Remove-Item $p -Force
+
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=rdp-new-$env:GITHUB_RUN_ID
+          $ip = $null
+          for ($i = 0; $i -lt 15; $i++) {
+            $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null) | Select-Object -First 1
+            if ($ip) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $ip) { Write-Error 'Tailscale IP not assigned'; exit 1 }
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $ip"
+
+      - name: Install Rtl Terminal
+        shell: powershell
+        run: |
+          $url = "https://github.com/mirbehnam/RtlTerminal/releases/download/v1.0.4/RtlTerminal-Setup-1.0.4-x64.exe"
+          $setup = "$env:TEMP\RtlTerminal-Setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $setup -UseBasicParsing
+          Start-Process -FilePath $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-" -Wait
+          Remove-Item $setup -Force
+          $rtl = "C:\Program Files\behnamapps\Rtl Terminal\RtlTerminal.exe"
+          if (-not (Test-Path $rtl)) { Write-Error "Rtl Terminal install check failed"; exit 1 }
+          Write-Host "Rtl Terminal installed."
+
+      - name: Keep session alive for 6 hours
+        shell: powershell
+        run: |
+          Write-Host "RDP started. Keeping session alive for 6 hours..."
+          $endTime = (Get-Date).AddHours(6)
+          while ((Get-Date) -lt $endTime) {
+            Write-Host "Remaining time: $(($endTime - (Get-Date)).ToString('hh\:mm\:ss'))"
+            Start-Sleep -Seconds 60
+          }
+          Write-Host "6 hours passed. Shutting down."
