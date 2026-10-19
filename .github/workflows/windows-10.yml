@@ -46,7 +46,8 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           # OpenCode's official Windows installation path.
-          npm install --global opencode-ai
+          # "latest" explicitly pulls the newest published stable version from npm.
+          npm install --global opencode-ai@latest
           if ($LASTEXITCODE -ne 0) {
             throw "OpenCode installation failed"
           }
@@ -111,14 +112,28 @@ jobs:
       - name: Install Rtl Terminal
         shell: powershell
         run: |
-          $url = "https://github.com/mirbehnam/RtlTerminal/releases/download/v1.0.4/RtlTerminal-Setup-1.0.4-x64.exe"
-          $setup = "$env:TEMP\RtlTerminal-Setup.exe"
-          Invoke-WebRequest -Uri $url -OutFile $setup -UseBasicParsing
+          $ErrorActionPreference = "Stop"
+
+          # Resolve the newest published release dynamically (no hardcoded version).
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/mirbehnam/RtlTerminal/releases/latest" `
+            -Headers @{ "User-Agent" = "github-actions"; "Accept" = "application/vnd.github+json" }
+          $asset = $release.assets |
+            Where-Object { $_.name -match '^RtlTerminal-Setup-.*-x64\.exe$' } |
+            Select-Object -First 1
+          if (-not $asset) {
+            throw "No x64 installer found in RtlTerminal release $($release.tag_name)"
+          }
+
+          Write-Host "Latest Rtl Terminal: $($release.tag_name) -> $($asset.name)"
+          $setup = Join-Path $env:TEMP $asset.name
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $setup -UseBasicParsing
           Start-Process -FilePath $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-" -Wait
           Remove-Item $setup -Force
+
           $rtl = "C:\Program Files\behnamapps\Rtl Terminal\RtlTerminal.exe"
           if (-not (Test-Path $rtl)) { Write-Error "Rtl Terminal install check failed"; exit 1 }
-          Write-Host "Rtl Terminal installed."
+          Write-Host "Rtl Terminal $($release.tag_name) installed."
 
       - name: Keep session alive for 6 hours
         shell: powershell
