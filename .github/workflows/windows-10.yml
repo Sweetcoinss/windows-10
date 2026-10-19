@@ -45,9 +45,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # OpenCode's official Windows installation path.
-          # "latest" explicitly pulls the newest published stable version from npm.
-          npm install --global opencode-ai@latest
+          # OpenCode V2 is published as @opencode/cli (V1 was "opencode-ai").
+          # Remove the legacy V1 package so its shim cannot shadow the V2 binary.
+          npm uninstall --global opencode-ai 2>$null | Out-Null
+
+          npm install --global @opencode/cli@latest
           if ($LASTEXITCODE -ne 0) {
             throw "OpenCode installation failed"
           }
@@ -58,6 +60,8 @@ jobs:
           if (-not $opencode) {
             throw "OpenCode was installed but its command was not found"
           }
+          Write-Host "OpenCode V2 installed at: $opencode"
+          Write-Host "OpenCode version: $(& opencode --version)"
 
           # Make lm work in both CMD and PowerShell terminals.
           $binDir = Join-Path $env:USERPROFILE "bin"
