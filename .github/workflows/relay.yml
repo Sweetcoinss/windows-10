@@ -143,11 +143,12 @@ jobs:
 
           function Register {
             try {
-              Invoke-RestMethod -Uri "$partner/api/ai/bridge/register" -Method POST -Headers @{ "X-Bridge-Secret" = $bsec } -TimeoutSec 20 |
-                Out-Null
-              Write-Host "registered to $partner at $(Get-Date -Format HH:mm:ss)"
+              $b = @{ url = "http://$ts`:$port"; name = "relay-$env:GITHUB_RUN_ID" } | ConvertTo-Json -Compress
+              Invoke-RestMethod -Uri "$partner/api/ai/bridge/register" -Method POST -ContentType "application/json" `
+                -Body $b -Headers @{ "X-Bridge-Secret" = $bsec } -TimeoutSec 20 | Out-Null
+              Write-Host "registered to $partner (http://$ts`:$port) at $(Get-Date -Format HH:mm:ss)"
               return $true
-            } catch { Write-Warning "register failed: $_"; return $false }
+            } catch { Write-Warning ("register failed: {0}" -f $_.Exception.Message); return $false }
           }
 
           function Alive {
