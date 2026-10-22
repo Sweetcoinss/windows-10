@@ -1,0 +1,69 @@
+name: Partner probe
+
+# A five-minute check of the chain between a GitHub VM and a studio partner
+# machine over Tailscale: does the VM reach the partner at all, and with which
+# bridge secret, and what do the partner endpoints answer?
+
+on:
+  workflow_dispatch:
+    inputs:
+      partner:
+        required: true
+      bridge_secret:
+        required: true
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 12
+    steps:
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $p = "$env:TEMP\ts.msi"
+          Invoke-WebRequest -Uri $url -OutFile $p -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i","`"$p`"","/quiet","/norestart" -Wait
+          Remove-Item $p -Force
+
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=probe-$env:GITHUB_RUN_ID
+          $ip = $null
+          for ($i = 0; $i -lt 15; $i++) {
+            $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null) | Select-Object -First 1
+            if ($ip) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $ip) { Write-Error 'Tailscale IP not assigned'; exit 1 }
+          Write-Host "VM Tailscale IP: $ip"
+
+      - name: Ping and reach the partner
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $partner = "${{ inputs.partner }}".TrimEnd("/")
+          Write-Host "partner: $partner"
+          for ($i = 0; $i -lt 30; $i++) {
+            Write-Host "--- attempt $($i+1) at $(Get-Date -Format HH:mm:ss)"
+            # 1. plain reach with Test-NetConnection (tcp)
+            $u = [Uri]$partner
+            $tcp = Test-NetConnection -ComputerName $u.Host -Port $u.Port -WarningAction SilentlyContinue
+            Write-Host ("tcp open: {0} (took {1:f0} ms)" -f $tcp.TcpTestSucceeded, ($tcp.PingReplyDetails.ResponseTime ?? 0))
+            # 2. the agentsmd call
+            try {
+              $r = Invoke-RestMethod -Uri "$partner/api/ai/bridge/agentsmd" -Headers @{ "X-Bridge-Secret" = "${{ inputs.bridge_secret }}" } -TimeoutSec 15
+              Write-Host "agentsmd ok, chars: $($r.text.Length)"
+              break
+            } catch {
+              Write-Host "agentsmd failed: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 20
+          }
+
+      - name: Keep the probe machine a minute
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 60
+          Write-Host "probe done"
