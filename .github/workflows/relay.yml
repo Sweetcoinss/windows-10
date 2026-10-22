@@ -102,15 +102,15 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $home = "$env:LOCALAPPDATA\ProjectIGIStudio"
-          New-Item -ItemType Directory -Path "$home\.igistudio" -Force | Out-Null
+          $hdir = "$env:LOCALAPPDATA\ProjectIGIStudio"
+          New-Item -ItemType Directory -Path "$hdir\.igistudio" -Force | Out-Null
           # the remote's tool callbacks go straight to the partner, so the
           # pairing file carries the partner's bridge secret
           @{ url = "${{ inputs.partner }}"; secret = "${{ inputs.bridge_secret }}" } | ConvertTo-Json -Compress |
-            Set-Content "$home\.igistudio\bridge.json" -Encoding UTF8
+            Set-Content "$hdir\.igistudio\bridge.json" -Encoding UTF8
           # the AI's training manual lives on the partner (the 32-bit machine,
           # which boots whenever it wants): try until it answers, then keep going
-          $md = "$home\AGENTS.md"
+          $md = "$hdir\AGENTS.md"
           for ($i = 0; $i -lt 20; $i++) {
             try {
               $r = Invoke-RestMethod -Uri "${{ inputs.partner }}/api/ai/bridge/agentsmd" -Headers @{ "X-Bridge-Secret" = "${{ inputs.bridge_secret }}" } -TimeoutSec 20
@@ -185,3 +185,4 @@ jobs:
           }
           Get-Process studio-server -ErrorAction SilentlyContinue | Stop-Process -Force
           Write-Host "relay shift over."
+
