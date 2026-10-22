@@ -50,7 +50,7 @@ jobs:
             # 1. plain reach with Test-NetConnection (tcp)
             $u = [Uri]$partner
             $tcp = Test-NetConnection -ComputerName $u.Host -Port $u.Port -WarningAction SilentlyContinue
-            Write-Host ("tcp open: {0} (took {1:f0} ms)" -f $tcp.TcpTestSucceeded, ($tcp.PingReplyDetails.ResponseTime ?? 0))
+            Write-Host ("tcp open: {0}" -f $tcp.TcpTestSucceeded)
             # 2. the agentsmd call
             try {
               $r = Invoke-RestMethod -Uri "$partner/api/ai/bridge/agentsmd" -Headers @{ "X-Bridge-Secret" = "${{ inputs.bridge_secret }}" } -TimeoutSec 15
