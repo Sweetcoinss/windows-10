@@ -1,0 +1,187 @@
+name: OpenCode relay
+
+# The 32-bit Project IGI Studio cannot run OpenCode itself (there is no ia32
+# build), so a machine needs a brain elsewhere: this workflow stands one up on
+# a GitHub VM, joins the owner's Tailscale, then serves the studio's AI relay
+# (`studio-server relay`) and introduces itself to the 32-bit machine, which
+# then talks to it over tailscale with the shared secret. Dispatched by the
+# 32-bit app itself (or by hand from the Actions tab).
+
+on:
+  workflow_dispatch:
+    inputs:
+      partner:
+        description: "The 32-bit studio's bridge base (http://<its tailscale ip>:<its port>)"
+        required: true
+      port:
+        description: "Port for this relay to serve on"
+        required: false
+        default: "18510"
+      bridge_secret:
+        description: "The partner's bridge secret (they wrote it in bridge.json)"
+        required: true
+      relay_secret:
+        description: "Shared secret for the relay's own endpoints (X-Relay-Secret)"
+        required: true
+
+jobs:
+  relay:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Install OpenCode
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          # OpenCode V2 is published as @opencode/cli (V1 was "opencode-ai").
+          npm uninstall --global opencode-ai 2>$null | Out-Null
+          npm install --global @opencode/cli@latest
+          if ($LASTEXITCODE -ne 0) { throw "OpenCode installation failed" }
+          $opencode = (Get-Command opencode.cmd -ErrorAction SilentlyContinue).Source
+          if (-not $opencode) { $opencode = (Get-Command opencode -ErrorAction SilentlyContinue).Source }
+          if (-not $opencode) { throw "OpenCode was installed but its command was not found" }
+          Write-Host "OpenCode V2 installed: $(& opencode --version)"
+
+      - name: Sign OpenCode in (secret OPENCODE_AUTH_JSON if it exists)
+        shell: powershell
+        run: |
+          $auth = "${{ secrets.OPENCODE_AUTH_JSON }}"
+          if ($auth) {
+            $dir = "$env:USERPROFILE\.local\share\opencode"
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            $auth | Set-Content -Path "$dir\auth.json" -Encoding UTF8
+            Write-Host "auth.json written"
+          } else {
+            Write-Warning "No OPENCODE_AUTH_JSON secret: only signed-out (free) models will answer"
+          }
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $p = "$env:TEMP\ts.msi"
+          Invoke-WebRequest -Uri $url -OutFile $p -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i","`"$p`"","/quiet","/norestart" -Wait
+          Remove-Item $p -Force
+
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=relay-$env:GITHUB_RUN_ID
+          $ip = $null
+          for ($i = 0; $i -lt 15; $i++) {
+            $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null) | Select-Object -First 1
+            if ($ip) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $ip) { Write-Error 'Tailscale IP not assigned'; exit 1 }
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $ip"
+
+      - name: Pull the relay server (release asset studio-server.zip, tag relay-assets)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo = "$env:GITHUB_REPOSITORY"
+          $url = "https://github.com/$repo/releases/download/relay-assets/studio-server.zip"
+          $zip = "$env:TEMP\server.zip"
+          for ($i = 0; $i -lt 4; $i++) {
+            try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing; break } catch { Start-Sleep -Seconds 10 }
+          }
+          if (-not (Test-Path $zip)) { throw "studio-server.zip not reachable at $url" }
+          New-Item -ItemType Directory -Path "$env:USERPROFILE\relayserver" -Force | Out-Null
+          Expand-Archive -Path $zip -Destination "$env:TEMP\serverx" -Force
+          $dir = Get-ChildItem "$env:TEMP\serverx" -Directory | Select-Object -First 1
+          Move-Item $dir.FullName "$env:USERPROFILE\relayserver\studio-server" -Force
+          $exe = "$env:USERPROFILE\relayserver\studio-server\studio-server.exe"
+          if (-not (Test-Path $exe)) { throw "the server did not land where expected ($exe)" }
+          Write-Host "server staged at $env:USERPROFILE\relayserver\studio-server"
+
+      - name: Pair with the partner (bridge) and fetch the AI manual
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $home = "$env:LOCALAPPDATA\ProjectIGIStudio"
+          New-Item -ItemType Directory -Path "$home\.igistudio" -Force | Out-Null
+          # the remote's tool callbacks go straight to the partner, so the
+          # pairing file carries the partner's bridge secret
+          @{ url = "${{ inputs.partner }}"; secret = "${{ inputs.bridge_secret }}" } | ConvertTo-Json -Compress |
+            Set-Content "$home\.igistudio\bridge.json" -Encoding UTF8
+          # the AI's training manual lives on the partner (the 32-bit machine,
+          # which boots whenever it wants): try until it answers, then keep going
+          $md = "$home\AGENTS.md"
+          for ($i = 0; $i -lt 20; $i++) {
+            try {
+              $r = Invoke-RestMethod -Uri "${{ inputs.partner }}/api/ai/bridge/agentsmd" -Headers @{ "X-Bridge-Secret" = "${{ inputs.bridge_secret }}" } -TimeoutSec 20
+              if ($r.ok -and $r.text) { $r.text | Set-Content $md -Encoding UTF8; Write-Host "AGENTS.md fetched ($($r.text.Length) chars)"; break }
+            } catch { Write-Host "partner not answered yet (try $($i+1))" ; Start-Sleep -Seconds 30 }
+          }
+          if (-not (Test-Path $md)) { Write-Warning "no AGENTS.md yet: the run keeps going and fetches it in the loop" }
+
+      - name: Start the relay, register to the partner, and keep it alive
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $exe = "$env:USERPROFILE\relayserver\studio-server\studio-server.exe"
+          $port = "${{ inputs.port }}"
+          $secret = "${{ inputs.relay_secret }}"
+          $partner = "${{ inputs.partner }}".TrimEnd("/")
+          $bsec = "${{ inputs.bridge_secret }}"
+          $ts = $env:TAILSCALE_IP
+
+          function Start-Relay {
+            Start-Process -FilePath $exe -ArgumentList "relay","--port",$port,"--secret",$secret -WindowStyle Hidden
+            for ($i = 0; $i -lt 30; $i++) {
+              try {
+                $h = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -Headers @{ "X-Relay-Secret" = $secret } -TimeoutSec 5
+                if ($h.ok) { Write-Host "relay healthy on $port"; return $true }
+              } catch { Start-Sleep -Seconds 2 }
+            }
+            return $false
+          }
+
+          function Register {
+            try {
+              Invoke-RestMethod -Uri "$partner/api/ai/bridge/register" -Method POST -Headers @{ "X-Bridge-Secret" = $bsec } -TimeoutSec 20 |
+                Out-Null
+              Write-Host "registered to $partner at $(Get-Date -Format HH:mm:ss)"
+              return $true
+            } catch { Write-Warning "register failed: $_"; return $false }
+          }
+
+          function Alive {
+            try {
+              $h = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -Headers @{ "X-Relay-Secret" = $secret } -TimeoutSec 5
+              return [bool]$h.ok
+            } catch { return $false }
+          }
+
+          if (-not (Start-Relay)) { Write-Error "relay did not come up"; exit 1 }
+          $regOk = $false
+          for ($i = 0; $i -lt 30; $i++) { if (Register) { $regOk = $true; break }; Start-Sleep -Seconds 30 }
+          if (-not $regOk) { Write-Warning "the partner never answered the first register; still serving" }
+          Write-Host "relay $ts`:$port ready for the studio"
+
+          $endTime = (Get-Date).AddMinutes(350)
+          $nextRegister = Get-Date
+          $nextManual = (Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $endTime) {
+            if (-not (Alive)) {
+              Write-Warning "relay died; restarting"
+              Get-Process studio-server -ErrorAction SilentlyContinue | Stop-Process -Force
+              Start-Relay | Out-Null
+              $nextRegister = Get-Date
+            }
+            if ((Get-Date) -ge $nextRegister) { Register | Out-Null; $nextRegister = (Get-Date).AddSeconds(60) }
+            if ((Get-Date) -ge $nextManual) {
+              try {
+                $r = Invoke-RestMethod -Uri "$partner/api/ai/bridge/agentsmd" -Headers @{ "X-Bridge-Secret" = $bsec } -TimeoutSec 20
+                if ($r.ok -and $r.text) { $r.text | Set-Content "$env:LOCALAPPDATA\ProjectIGIStudio\AGENTS.md" -Encoding UTF8 }
+              } catch { }
+              $nextManual = (Get-Date).AddMinutes(5)
+            }
+            Start-Sleep -Seconds 30
+          }
+          Get-Process studio-server -ErrorAction SilentlyContinue | Stop-Process -Force
+          Write-Host "relay shift over."
